@@ -115,7 +115,7 @@ Another option is to divide the world in small grids (one grid can have one or m
 The major flaw with this approach is that business distribution is uneven as there are a lot of businesses concentrated in new york and close to zero in the sahara desert. Ideally we want to use more granular grids for dense areas and large grids in sparse areas. Another potential challenge is to find neighboring grids of a fixed grid.
 
 ### Option 3: Geohash
-Better than option2, it works by reducing the two dimensional longitude and latitude data into a one dimensional string of letters and digits. Geohash works similarly to the previous approach, but it recursively divides the world into smaller and smaller grids with each additional bit. where each two bits correspond to a single quadrant:
+Better than option2, it works by reducing the two dimensional longitude and latitude data into a one dimensional string of letters and digits. Geohash works similarly to the previous approach, but it recursively divides the world into smaller and smaller grids with each additional bit. Start by splitting the world into four quadrants where each two bits correspond to a single quadrant. Now, divide each grid into four smaller grids. Each grid can be represented by alternating between longitude bit and latitude bit. Repeat till the grid size is within the precision desired.
 ![geohash-example](images/geohash-example.png)
 
 Geohashes are typically represented in base32. Here's the example geohash of google headquarters:
@@ -123,7 +123,7 @@ Geohashes are typically represented in base32. Here's the example geohash of goo
 1001 10110 01001 10000 11011 11010 (base32 in binary) → 9q9hvu (base32)
 ```
 
-It supports 12 levels of precision, but we only need up to 6 levels for our use-case:
+It supports 12 levels of precision and precision factor determines the size of the grid. We only need up to 6 levels for our use-case since geohashes longer than 6 have grids of size too small and less than 4 has grids of size too large. 4 to 6 is ideal.
 ![geohash-precision](images/geohash-precision.png)
 
 Geohashes enable us to quickly locate neighboring regions based on a substring of the geohash:
