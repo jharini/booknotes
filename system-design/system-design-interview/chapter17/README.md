@@ -126,27 +126,41 @@ Geohashes are typically represented in base32. Here's the example geohash of goo
 It supports 12 levels of precision and precision factor determines the size of the grid. We only need up to 6 levels for our use-case since geohashes longer than 6 have grids of size too small and less than 4 has grids of size too large. 4 to 6 is ideal.
 ![geohash-precision](images/geohash-precision.png)
 
-Geohashes enable us to quickly locate neighboring regions based on a substring of the geohash:
+To choose the right precision level, we want to find the minimal geohash length that covers the whole circle drawn by the user defined radius. Relationship between radius and length of geohash is shown:
+Radius(Kilometers) Geohash length
+0.5 km(0.31 miles)       6
+1 km(0.62 miles)         5
+2 km(1.24 miles)         5
+5 km(3.1 miles)          4
+20 km(12.42 miles)       4
+
+This approach works great mostly but has some edge cases that need to be discussed.
+
+Geohashes enable us to quickly locate neighboring regions based on a substring of the geohash (the longer a shared prefix is between two geohashes, the closer they are):
 ![geohash-substring](images/geohash-substrint.png)
 
 However, one issue \w geohashes is that there can be places which are very close to each other which don't share any prefix, because they're on different sides of the equator or meridian:
 ![boundary-issue-geohash](images/boundary-issue-geohash.png)
+So a simple prefix SQL query will fail to fetch all nearby businesses:
+```
+SELECT * FROM geohash_index WHERE geohash LIKE '9q8zn%'
+```
 
 Another issue is that two businesses can be very close but not share a common prefix because they're in different quadrants:
 ![geohash-boundary-issue-2](images/geohash-boundary-issue-2.png)
 
-This can be mitigated by fetching neighboring geohashes, not just the geohash of the user.
+This can be mitigated by fetching neighboring geohashes as well, not just the geohash of the user.
 
 A benefit of using geohashes is that we can use them to easily implement the bonus problem of increasing search radius in case insufficient businesses are fetched via query:
 ![geohash-expansion](images/geohash-expansion.png)
 
-This can be done by removing the last letter of the target geohash to increase radius.
+This can be done by removing the last digit of the target geohash to increase radius. If there are not enoug businesses, we continue to expand the scope by removing another digit. This way, the grid size is gradually expanded until the result is greater than the desired number of results. 
 
-### Quadtree
-A quadtree is a data structure, which recursively subdivides quadrants as deep as it needs to, based on business needs:
+### Option 4:Quadtree
+A quadtree is a data structure, which partitions a 2D space by recursively subdividing into four quadrants until the contents of the grids meet certain criteria. For example, the criterion can be to keep subdividing until the number of busiensses in the gride is not more than 100. This number is arbitrary as the actual number can be determined by business needs. With a quadtree we build an in-memory tree structure to answer queries:
 ![quadtree-example](images/quadtree-example.png)
 
-This is an in-memory solution which can't easily be implemented in a database.
+This is an in-memory solution which can't easily be implemented in a database. It runs on each LBS server, and the data structure is biult at server startup time.
 
 Here's how it might look conceptually:
 ![quadtree-concept](images/quadtree-concept.png)
@@ -164,18 +178,23 @@ public void buildQuadtree(TreeNode node) {
 ```
 
 In a leaf node, we store:
- * Top-left, bottom-right coordinates to identify the quadrant dimensions
- * List of business IDs in the grid
+ * Top-left, bottom-right coordinates to identify the quadrant dimensions - 32 bytes (8 bytes x 4)
+ * List of business IDs in the grid - 8 bytes per ID x 100 (maximal number of businesses allowed in one grid)
+   Total - 832 bytes
 
-In an internalt node we store:
- * Top-left, bottom-right coordinates of quadrant dimensions
- * 4 pointers to children
+In an internal node we store:
+ * Top-left, bottom-right coordinates of quadrant dimensions - 32 bytes (8 bytes x 4)
+ * pointers to 4 children - 32 bytes (8 bytes x 4)
+   Total - 64 bytes
 
-The total memory to represent the quadtree is calculated as ~1.7GB in the book if we assume that we operate with 200mil businesses.
+The total memory to represent the quadtree is calculated as ~1.7GB in the book if we assume that we operate with 200mil businesses (number of leaf nodes = 200 mil/100 = about 2 mil, number of internal nodes = 2mil x 1/3 = about 0.67 mil, total memory requirement = 2mil x 832 bytes + 0.67 mil x 64 bytes = about 1.71 GB). Time taken to build it = (n/100) log (n/100).
 
 Hence, a quadtree can be stored in a single server, in-memory, although we can of course replicate it for redundancy and load balancing purposes.
 
-One consideration to take into consideration if this approach is adopted - startup time of server can be a couple of minutes while the quadtree is being built.
+One consideration to take into consideration if this approach is adopted - startup time of server can be a couple of minutes while the quadtree is being built.Time taken to build it = (n/100) log (n/100) = a few minutes for 200 million businesses. This is not ideal for server startup since server cannot serve traffic when the quadtree is being built. So we should rollout new releases to small subset of servers at a time. This avoids taking a large swath of the server cluster offline and causes service brownout. Blue/green deployment can also be used, but an entire cluster of new servers fetching 200 million businesses at the same time from teh database service can put a lot of strain on the system. This can be done, but it may complicate the design and you should mention that in the interview. 
+
+* build quadtree in memory
+* after it is built, start searching from teh root and traverse the tree, until we find the leaf node where the search origin is. If that leaf node has 100 businesses, return the node. Otherwise, add businesses from its neighbors until enough businesses are returned. 
 
 Hence, this should be taken into account during the deployment process. Eg a healthcheck endpoint can be exposed and queried to signal when the quadtree build is finished.
 
@@ -186,16 +205,16 @@ It is nevertheless possible to update the quadtree on the fly, but that would co
 Example quadtree of Denver:
 ![denver-quadtree](images/denver-quadtree.png)
 
-### Google S2
-Google S2 is a geometry library, which supports mapping 2D points on a 1D plane using hilbert curves. Objects close to each other on the 2D plane are close on the hilbert curve as well:
+### Option 5:Google S2
+Google S2 is a geometry library, which supports mapping 2D points on a 1D plane using Hilbert curves (Objects close to each other on the 2D plane are close on the hilbert curve as well and are close in the 1D space - search is more efficient in 1D space):
 ![hilbert-curve](images/hilbert-curbe.png)
 
-This library is great for geofencing, which supports covering arbitrary areas vs. confining yourself to specific quadrants.
+This library is great for geofencing, which supports covering arbitrary areas vs. confining yourself to specific quadrants. A geofence is a virtual perimeter for a real world geographic area. A geo fence could be dyanmically generated - as in a radius around a point location, or a geo fence can be predefined set of boundaries (such as school zones or neighborhood boundaries). Geofencing allows u sot define perimeters that surround the areas of interest and to send notifications to users who are out of the areas. This can provide richer functionalities than just returning nearby businesses. 
 ![geofence-example](images/geofence-example.png)
 
 This functionality can be used to support more advanced use-cases than nearby businesses.
 
-Another benefit of Google S2 is its region cover algorithm, which enables us to define more granular precision levels, than those provided by geohashes.
+Another benefit of Google S2 is its Region Cover algorithm, which enables us to define more granular precision levels (min level, max level and max cells - cell sizes are flexible), than those provided by geohashes.
 
 ### Recommendation
 There is no perfect solution, different companies adopt different solutions:
@@ -213,20 +232,24 @@ Here's a quick summary of quadtrees:
  * Slightly harder to implement as it requires us to build a tree
  * Supports fetching k-nearest neighbors instead of businesses within radius, which can be a good use-case for certain features
  * Grid size can be dynamically adjusted based on population density
- * Updating the index is more complicated than updating the geohash variant. All problems with updating and balancing trees are present when working with quad trees.
+ * Updating the index is more complicated than updating the geohash variant. All problems with updating and balancing trees are present when working with quad trees. Rebalancing is necessary if, for eg, a leaf node has no room for a new additon. A possible fix is to over allocate the ranges.
 
 # Step 3 - Design Deep Dive
 Let's dive deeper into some areas of the design.
 
 ## Scale the database
-The business table can be scaled by sharding it in case it doesn't fit in a single server instance.
+The business table can be scaled by sharding it by business ID (ensures load is evenly distributed among all the shards and operationally it is easy to maintain) in case it doesn't fit in a single server instance.
 
+Geospatial index table can use either geohash or quadtree. We use geohash because of its simplicity.
 The geohash table can be represented by two columns:
 ![geohash-table-example](images/geohash-table-example.png)
+We can either keep the business IDs as JSON or keep each business ID as a separate row. First option has a lot of edge cases and updating is a pain and needs locks, so second option is preferred and it doesn't need any locks when updating.
 
 We don't need to shard the geohash table as we don't have that much data. We calculated that it takes ~1.7gb to build a quad tree and geohash space usage is similar.
 
 We can, however, replicate the table to scale the read load.
+
+Two general approaches for spreading the load of a RDB server - add read replicas or shard the database. Usually sharding is good if read and write are similar or if the size is huge but adding read replicas is better for geohash table since size is small and reads >>> writes.
 
 ## Caching
 Before using caching, we should ask ourselves if it is really necessary. In our case, the workflow is read-heavy and data can fit into a single server, so this kind of data is ripe for caching.
@@ -268,12 +291,12 @@ We can deploy multiple LBS service instances across the globe so that users quer
 It also enables us to spread traffic evenly across the globe. This could also be required in order to comply with certain data privacy laws.
 
 ## Follow-up question - filter businesses by type or time
-Once businesses are filtered, the result set is going to be small, hence, it is acceptable to filter the data in-memory.
+Once businesses are filtered, the result set is going to be small, hence, it is acceptable to filter the data in-memory - return all the business ids in the geohash, hydrate the business object and filter them based on opening time or business type. This assumes the business object contains all this info in the business table.
 
 ## Final design diagram
 ![final-design](images/final-design.png)
  * Client tries to locate restaurants within 500meters of their location
- * Load balancer forwards the request to the LBS
+ * Load balancer forwards the request to the LBS (location based service or proximity service)
  * LBS maps the radius to geohash with length 6
  * LBS calculates neighboring geohashes and adds them to the list
  * For each geohash, LBS calls the redis server to fetch corresponding business IDs. This can be done in parallel.
