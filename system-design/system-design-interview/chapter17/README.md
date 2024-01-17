@@ -72,17 +72,18 @@ We'll also need a geo-index table so that we efficiently process spatial operati
 Here's a high-level overview of the system:
 ![high-level-design](images/high-level-deisgn.png)
  * The load balancer automatically distributes incoming traffic across multiple services. A company typically provides a single DNS entry point and internally routes API calls to appropriate services based on URL paths.
- * Location-based service (LBS) - read-heavy, stateless service, responsible for serving read requests for nearby businesses
+ * Location-based service (LBS) - read-heavy, stateless service so its easy to scale horizontally, responsible for serving read requests for nearby businesses, QPS is high especially during peak hours in dense areas.
  * Business service - supports CRUD operations on businesses.
- * Database cluster - stores business information and replicates it in order to scale reads. This leads to some inconsistency for LBS to read business information, which is not an issue for our use-case
- * Scalability of business service and LBS - since both services are stateless, we can easily scale them horizontally
+   - write operations QPS low (create update delete businesses), read operations QPS high during peak hours (view detailed info about businesses).
+ * Database cluster - stores business information and replicates it in order to scale reads. This leads to some inconsistency for LBS to read business information, which is not an issue for our use-case.Uses primary secondary setup where primary handles all the writes and replicates to the multiple replicas which are used for reading. Data is first saved to primary and then replicated to replicas - has a small delay which is ok because business info does not need to be updated real time.
+ * Scalability of business service and LBS - since both services are stateless, we can easily scale them horizontally for peak hour traffic (meal time) and remove for off peak hours (sleep time). If system is on cloud, we can setup different regions and availability zones to further improve availability.
 
 ## Algorithms to fetch nearby businesses
 In real life, one might use a geospatial database, such as Geohash in Redis or Postgres with PostGIS extension.
 
 Let's explore how these databases work and what other alternative algorithms there are for this type of problem.
 
-### Two-dimensional search
+### Option1: Two-dimensional search
 The most intuitive and naive approach to solving this problem is to draw a circle around the person and fetch all businesses within the circle's radius:
 ![2d-search](images/2d-search.png)
 
