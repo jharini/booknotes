@@ -101,18 +101,21 @@ This is because we still need to subsequently filter a lot of data regardless of
 ![2d-query-problem](images/2d-query-problem.png)
 
 We can, however, build 2D indexes and there are different approaches to that:
+* Hash: even grid, geohash, cartesian tiers, etc
+* Tree: quadtree, Google S2, RTree, etc
+Even though implementations are different, they all divide the map into smaller areas and build indexes for fast search. Geohash, quadtree and Google S2 are most widely used in real world applications.
 ![2d-index-options](images/2d-index-options.png)
 
 We'll discuss the ones highlighted in purple - geohash, quadtree and google S2 are the most popular approaches.
 
-### Evenly divided grid
-Another option is to divide the world in small grids:
+### Option 2: Evenly divided grid
+Another option is to divide the world in small grids (one grid can have one or more businesses and every business is in one grid only).
 ![evenly-divided-grid](images/evenly-divided-grid.png)
 
-The major flaw with this approach is that business distribution is uneven as there are a lot of businesses concentrated in new york and close to zero in the sahara desert.
+The major flaw with this approach is that business distribution is uneven as there are a lot of businesses concentrated in new york and close to zero in the sahara desert. Ideally we want to use more granular grids for dense areas and large grids in sparse areas. Another potential challenge is to find neighboring grids of a fixed grid.
 
-### Geohash
-Geohash works similarly to the previous approach, but it recursively divides the world into smaller and smaller grids, where each two bits correspond to a single quadrant:
+### Option 3: Geohash
+Better than option2, it works by reducing the two dimensional longitude and latitude data into a one dimensional string of letters and digits. Geohash works similarly to the previous approach, but it recursively divides the world into smaller and smaller grids with each additional bit. where each two bits correspond to a single quadrant:
 ![geohash-example](images/geohash-example.png)
 
 Geohashes are typically represented in base32. Here's the example geohash of google headquarters:
