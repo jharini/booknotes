@@ -50,7 +50,7 @@ What does the backend do?
  * For each location update, find all active users which should receive it and forward it to them
  * Do not forward location data if distance between friends is beyond the configured threshold
 
-This sounds simple but the challenge is to design the system for the scale we're operating with.
+This sounds simple but the challenge is to design the system for the scale we're operating with. For eg, 10 million DAU and with each user updating every 30 seconds, there are 334k updates per second. if on average each user has 400 friends, and we further assume that roughly 10% of those friends are online and nearby, every second the backend forwards 334k x 400 x 10% = 14 million location updates per second.
 
 We'll start with a simpler design at first and discuss a more advanced approach in the deep dive:
 ![simple-high-level-design](images/simple-high-level-design.png)
@@ -83,17 +83,17 @@ On average, there's going to be 40 location updates to forward as a user has 400
 
 ## API Design
 Websocket Routines we'll need to support:
- * periodic location update - user sends location data to websocket server
- * client receives location update - server sends friend location data and timestamp
- * websocket client initialization - client sends user location, server sends back nearby friends location data
- * Subscribe to a new friend - websocket server sends a friend ID mobile client is supposed to track eg when friend appears online for the first time
- * Unsubscribe a friend - websocket server sends a friend ID, mobile client is supposed to unsubscribe from due to eg friend going offline
+ * periodic location update - user sends location data to websocket server, response nothing
+ * client receives location update - server sends friend location data and timestamp as response
+ * websocket client initialization - client sends user location (latitude, longitude and timestamp), server sends back nearby friends location data
+ * Subscribe to a new friend - websocket server sends a friend ID mobile client is supposed to track eg when friend appears online for the first time, response is friend's latest latitude, longitude and timestamp
+ * Unsubscribe a friend - websocket server sends a friend ID, mobile client is supposed to unsubscribe from due to eg friend going offline, response nothing
 
 HTTP API - traditional request/response payloads for auxiliary responsibilities.
 
 ## Data model
- * The location cache will store a mapping between `user_id` and `lat,long,timestamp`. Redis is a great choice for this cache as we only care about current location and it supports TTL eviction which we need for our use-case.
- * Location history table stores the same data but in a relational table \w the four columns stated above. Cassandra can be used for this data as it is optimized for write-heavy loads.
+ * The location cache will store a mapping between `user_id` and `lat,long,timestamp`. Redis is a great choice for this cache as we only care about current location and it supports auto purge/TTL eviction which we need for our use-case. It provides super fast read and write operations. Also does not need durable storage. If Redis goes down, we can start with empty new instance and let cache be filled as new location updates stream in. The active users could miss location updates from friends for an update cycle or two while the new cache warms. It is an acceptable tradeoff. 
+ * Location history table stores the same data but in a relational table \w the four columns stated above. Cassandra can be used for this data as it is optimized for write-heavy loads. RDBMS can be used too and data is sharded with user_id for even distribution and for easy operational maintenance.
 
 # Step 3 - Design Deep Dive
 Let's discuss how we scale the high-level design so that it works at the scale we're targetting.
@@ -111,7 +111,7 @@ We will need around 200gb of memory to maintain all pub/sub channels. This can b
 
 Given that we need to push ~14mil location updates per second, we will however need at least 140 redis servers to handle that amount of load, assuming that a single server can handle ~100k pushes per second.
 
-Hence, we'll need a distributed redis server cluster to handle the intense CPU load.
+Hence, we'll need a distributed redis server cluster to handle the intense CPU load. The channels are independent of each other so it is relatively easy to spread the channels among multiple Pub/Sub servers by sharding based on publisher's user ID.
 
 In order to support a distributed redis cluster, we'll need to utilize a service discovery component, such as zookeeper or etcd, to keep track of which servers are alive.
 
