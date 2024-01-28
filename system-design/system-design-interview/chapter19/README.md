@@ -76,7 +76,7 @@ Most navigation algorithms use a modified version of Djikstra or A* algorithms.
 
 Pathfinding performance is sensitive to the size of the graph. To work at scale, we can't represent the whole world as a graph and run the algorithm on it.
 
-Instead, we use a technique similar to tiling - we subdivide the world into smaller and smaller graphs.
+Instead, we use a technique similar to tiling - we subdivide the world into smaller and smaller grids. For each grid, we convert the roads within the gride into a small graph data structure that consists of the notes(intersections) and edges(roads) inside the geographical area covered by the grid. We call these grids routing tiles. Each routing tile holds references to all the other tiles it connects to. This is how the routing algorithms can stitch together a bigger road graph as it traverses these interconnected routing tiles. One difference between map tiles and routing tiles is that while both are grids covering certain geographical areas, map tiles are PNG images and routing tiles are binary files of road data for the area covered by the tiles.  
 
 Routing tiles hold references to neighboring tiles and algorithms can stitch together a bigger road graph as it traverses interconnected tiles:
 ![routing-tiles](images/routing-tiles.png)
@@ -90,9 +90,10 @@ However, for larger routes, stitching together small, detailed routing tiles wou
 For storage, we need to store:
  * map of the world - estimated as ~70pb based on all the tiles we need to store, but factoring in compression of very similar tiles (eg vast desert)
  * metadata - negligible in size, so we can skip it from calculation
- * Road info - stored as routing tiles
+ * Road info - stored as routing tiles (terabytes in size - considering whole world and three sizes of tiles, it is 440PB, after removing mountains and oceans and such it is down to 44 to 88 PB.... lets round to 50 PB for the smallest level and around 50 PB for the remaining zoomed out levels, so in total 100 PB)
+ * Two types of requests - navigation requests and location update requests.
 
-Estimated QPS for navigation requests - 1bil DAU at 35min of usage per week -> 5bil minutes per day. 
+Estimated QPS for navigation requests - 1bil DAU at 35 billion min of usage per week -> 5bil minutes per day. 
 Assuming gps update requests are batched, we arrive at 200k QPS and 1mil QPS at peak load
 
 # Step 2 - Propose High-Level Design and Get Buy-In
@@ -108,10 +109,11 @@ It is responsible for recording a user's location updates:
 Instead of sending location updates to the server all the time, we can batch the updates on the client-side and send batches instead:
 ![location-update-batches](images/location-update-batches.png)
 
-Despite this optimization, for a system of Google Maps scale, load will still be significant. Therefore, we can leverage a database, optimized for heavy writes such as Cassandra.
+Despite this optimization, for a system of Google Maps scale, load will still be significant. Therefore, we can leverage a database, optimized for heavy writes and is highly scalable, such as Cassandra.
 
-We can also leverage Kafka for efficient stream processing of location updates, meant for further analysis.
+We can also leverage a stream processing engine like Kafka for efficient stream processing of location updates, meant for further analysis.
 
+Communication protocol - HTTP with the keep alive option is a good choice because it is very efficient.
 Example location update request payload:
 ```
 POST /v1/locations
@@ -120,7 +122,7 @@ Parameters
 ```
 
 ## Navigation service
-This component is responsible for finding fast routes between A and B in a reasonable time (a little bit of latency is okay). Route need not be the fastest, but accuracy is important.
+This component is responsible for finding fast routes between A and B in a reasonable time (a little bit of latency is okay). Route need not be the fastest, but accuracy is critical.
 
 Example request payload:
 ```
@@ -154,7 +156,7 @@ Example response:
 }
 ```
 
-Traffic changes and reroutes are not taken into consideration yet, those will be tackled in the deep dive section.
+Traffic changes and reroutes are not taken into consideration yet, those will be tackled by the Adaptive ETA in the deep dive section.
 
 ## Map rendering
 Holding the entire data set of mapping tiles on the client-side is not feasible as it's petabytes in size.
@@ -173,7 +175,7 @@ CDNs enable users to fetch map tiles from point-of-presence servers (POP) which 
 
 Options to consider for determining map tiles:
  * geohash for map tile can be calculated on the client-side. If that's the case, we should be careful that we commit to this type of map tile calculation for the long-term as forcing clients to update is hard
- * alternatively, we can have simple API which calculates the map tile URLs on behalf of the clients at the cost of additional API call
+ * alternatively, we can have simple API which calculates the map tile URLs on behalf of the clients at the cost of additional API call (takes input of latitude, longitude and returns 9 tiles, tile in position and 8 surrounding tiles)
 ![map-tile-url-calculation](images/map-tile-url-calculation.png)
 
 # Step 3 - Design Deep Dive
@@ -192,7 +194,7 @@ We can also leverage libraries to compress adjacency lists into binary files eff
 ### User location data
 User location data is very useful for updaring traffic conditions and doing all sorts of other analysis.
 
-We can use Cassandra for storing this kind of data as its nature is to be write-heavy.
+We can use Cassandra for storing this kind of data as its nature is to be write-heavy and conducive for horizontal scaling.
 
 Example row:
 ![user-location-data-row](images/user-location-data-torw.png)
@@ -211,16 +213,18 @@ As we discussed, we will precompute map tiling images and store them in CDN.
 Let's focus on the database design and how user location is stored in detail for this service.
 ![location-service-diagram](images/location-service-diagram.png)
 
-We can use a NoSQL database to facilitate the heavy write load we have on location updates. We prioritize availability over consistency as user location data often changes and becomes stale as new updates arrive.
+We can use a NoSQL database to facilitate the heavy write load we have on location updates. We prioritize availability along with partition tolerance over consistency as user location data often changes and becomes stale as new updates arrive.
 
-We'll choose Cassandra as our database choice as it nicely fits all our requirements.
+We'll choose Cassandra as our database choice as it nicely fits all our requirements since it can handle our scale with strong availability guarantee.
 
 Example row we're going to store:
 ![user-location-row-example](images/user-location-row-example.png)
  * `user_id` is the partition key in order to quickly access all location updates for a particular user
  * `timestamp` is the clustering key in order to store the data sorted by the time a location update is received
 
-We also leverage Kafka to stream location updates to various other service which need the location updates for various purposes:
+Kafka is a low latency, high throughput data streaming platform designed for real time data feeds.
+
+We also leverage Kafka (message queue) to stream location updates to various other service which need the location updates for various purposes:
 ![location-update-streaming](images/location-update-streaming.png)
 
 ### Rendering map
@@ -231,7 +235,7 @@ As zoom levels increase, the number of map tiles quadruples:
 
 One optimization we can use is to not send the entire image information over the network, but instead represent tiles as vectors (paths & polygons) and let the client render the tiles dynamically.
 
-This will have substantial bandwidth savings.
+This will have substantial bandwidth savings. Also with vectorized images, the client can scale each element appropriately,providing a much smoother zooming experience and less jarring visual experience.
 
 ### Navigation service
 This service is responsible for finding the fastest routes:
@@ -308,7 +312,7 @@ user_3: r_2, r_8, r_9, …, r_m
 user_n: r_2, r_10, r21, ..., r_l
 ```
 
-If a traffic accident happens on some tile, we can identify all users whose path goes through that tile and re-route them.
+If a traffic accident happens on some tile, we can identify all users whose path goes through that tile and re-route them. But complexity of this is O(n x m) assuming there are n users and m routing tiles per user on average.
 
 To reduce the amount of tiles we store in the database, we can instead store the origin routing tile and several routing tiles in different resolution levels until the destination tile is also included:
 ```
@@ -319,10 +323,10 @@ user_1, r_1, super(r_1), super(super(r_1)), ...
 
 Using this, we only need to check if the final tile of a user includes the traffic accident tile to see if user is impacted.
 
-We can also keep track of all possible routes for a navigating user and notify them if a faster re-route is available.
+We can also keep track of all possible routes for a navigating user, recalculate ETAs regularly and notify them if a faster re-route is available. This is for the case when the traffic gets cleared and the affected tile can be used again for routing.
 
 ### Delivery protocols
-We have several options, which enable us to proactively push data to clients from the server:
+We have several options (mobile push notifications, long polling, websocket, server sent events (SSE)), which enable us to proactively push data to clients from the server:
  * Mobile push notifications don't work because payload is limited and it's not available for web apps
  * WebSocket is generally a better option than long-polling as it has less compute footprint on servers
  * We can also use server-sent events (SSE) but lean towards web sockets as they support bi-directional communication which can come in handy for eg a last-mile delivery feature
