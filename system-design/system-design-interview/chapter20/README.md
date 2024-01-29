@@ -1,5 +1,5 @@
 # Distributed Message Queue
-We'll be designing a distributed message queue in this chapter.
+We'll be designing a distributed message queue (provide communication and coordination between different building blocks of the system design) in this chapter.
 
 Benefits of message queues:
  * Decoupling - Eliminates tight coupling between components. Let them update separately.
@@ -98,7 +98,7 @@ Consumer groups are a set of consumers working together to consume messages from
  * Data storage stores messages in partitions.
  * State storage keeps the consumer states.
  * Metadata storage stores configuration and topic properties
- * The coordination service is responsible for service discovery (which brokers are alive) and leader election (which broker is leader, responsible for assigning partitions).
+ * The coordination service is responsible for service discovery (which brokers are alive) and leader election (which broker is leader - also called active controller, there can be only one in the cluster, responsible for assigning partitions). Controllers are elected using Apache ZooKeeper or etcd usually.
 
 # Step 3 - Design Deep Dive
 In order to achieve high throughput and preserve the high data retention requirement, we made some important design choices:
@@ -113,7 +113,7 @@ In order to find the best data store for messages, we must examine a message's p
  * Predominantly sequential read/write access pattern.
 
 What are our options:
- * Database - not ideal as typical databases don't support well both write and read heavy systems.
+ * Database - not ideal as typical databases don't support well both write heavy and read heavy systems. (relational db - create a topic table and write messages to the tables as rows, noSQL db - create a collection as a topic and write messages as documents) - not the right choice and can become a bottleneck of the system.
  * Write-ahead log (WAL) - a plain text file which only supports appending to it and is very HDD-friendly. 
    * We split partitions into segments to avoid maintaining a very large file.
    * Old segments are read-only. Writes are accepted by latest segment only.
@@ -156,8 +156,8 @@ It is critical because:
  * Messages are written to the WAL in groups sequentially, which leads to a lot of sequential writes and disk caching.
 
 There is a trade-off between latency and throughput:
- * High batching leads to high throughput and higher latency. 
- * Less batching leads to lower throughput and lower latency.
+ * High batching leads to high throughput (good) and high latency (bad). 
+ * Less batching leads to lower throughput (bad) and low latency (good).
 
 If we need to support lower latency since the system is deployed as a traditional message queue, the system could be tuned to use a smaller batch size.
 
@@ -173,7 +173,7 @@ One option is to introduce a routing layer, which route messages to the correct 
  * Message is forwarded to broker 1 who is the leader of the given partition
  * Follower replicas pull the new message from the leader. Once enough confirmations are received, the leader commits the data and responds to the producer.
 
-The reason for having replicas is to enable fault tolerance.
+The reason for having replicas is to enable fault tolerance. These replicas are called InSync replicas (ISRs).
 
 This approach works but has some drawbacks:
  * Additional network hops due to the extra component
