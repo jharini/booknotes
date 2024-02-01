@@ -14,7 +14,7 @@ Let's try to understand the problem first:
  * C: How long should we keep the data?
  * I: Let's assume 1y retention.
  * C: May we reduce metrics data resolution for long-term storage?
- * I: Keep newly received metrics for 7 days. Roll them up to 1m resolution for next 30 days. Further roll them up to 1h resolution after 30 days.
+ * I: Great question! Keep newly received metrics for 7 days. Roll them up to 1m resolution for next 30 days. Further roll them up to 1h resolution after 30 days.
  * C: What are the supported alert channels?
  * I: Email, phone, PagerDuty or webhooks.
  * C: Do we need to collect logs such as error or access logs?
@@ -52,7 +52,7 @@ There are five core components involved in a metrics monitoring and alerting sys
  * Data collection - collect metrics data from different sources
  * Data transmission - transfer data from sources to the metrics monitoring system
  * Data storage - organize and store incoming data
- * Alerting - Analyze incoming data, detect anomalies and generate alerts
+ * Alerting - Analyze incoming data, detect anomalies and generate alerts. Send alerts to different communication channels.
  * Visualization - Present data in graphs, charts, etc
 
 ## Data model
@@ -125,8 +125,8 @@ It is critical, however, to keep the cardinality of labels low - ie, not using t
 ![high-level-design](images/high-level-design.png)
  * Metrics source - can be application servers, SQL databases, message queues, etc.
  * Metrics collector - Gathers metrics data and writes to time-series database
- * Time-series database - stores metrics as time-series. Provides a custom query interface for analyzing large amounts of metrics.
- * Query service - Makes it easy to query and retrieve data from the time-series DB. Could be replaced entirely by the DB's interface if it's sufficiently powerful.
+ * Time-series database - stores metrics as time-series. Provides a custom query interface for analyzing large amounts of metrics. Maintains indexes on labels to facilitate the fast lookup of time-series data by labels.
+ * Query service - Makes it easy to query and retrieve data from the time-series DB. Will be a very thin wrapper if it is a good time-series DB and could be replaced entirely by the DB's interface if it's sufficiently powerful.
  * Alerting system - Sends alert notifications to various alerting destinations.
  * Visualization system - Shows metrics in the form of graphs/charts.
 
@@ -202,26 +202,26 @@ There is a chance of data loss if the time-series DB is down, however. To mitiga
 This approach has several advantages:
  * Kafka is used as a highly-reliable and scalable distributed message platform
  * It decouples data collection and data processing from one another
- * It can prevent data loss by retaining the data in Kafka
+ * It can prevent data loss when database is unavailable by retaining the data in Kafka
 
-Kafka can be configured with one partition per metric name, so that consumers can aggregate data by metric names.
+Kafka can be configured with the number of partitions based on throughput requirements where partition metrics data is by metric names, so that consumers can aggregate data by metric names.
 To scale this, we can further partition by tags/labels and categorize/prioritize metrics to be collected first.
 ![metrics-collection-kafka](images/metrics-collection-kafka.png)
 
 The main downside of using Kafka for this problem is the maintenance/operation overhead.
-An alternative is to use a large-scale ingestion system like [Gorilla](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf).
-It can be argued that using that would be as scalable as using Kafka for queuing.
+An alternative is to use a large-scale ingestion system like Facebook's [Gorilla](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf) which is an in-memory time series database; it is designed to remain highly available for writes, even when there is a partial network failure.
+It can be argued that using that would be as scalable as using Kafka for intermediate queuing.
 
 ## Where aggregations can happen
 Metrics can be aggregated at several places. There are trade-offs between different choices:
- * Collection agent - client-side collection agent only supports simple aggregation logic. Eg collect a counter for 1m and send it to the metrics collector.
- * Ingestion pipeline - To aggregate data before writing to the DB, we need a stream processing engine like Flink. This reduces write volume, but we lose data precision as we don't store raw data.
- * Query side - We can aggregate data when we run queries via our visualization system. There is no data loss, but queries can be slow due to a lot of data processing.
+ * Collection agent - client-side collection agent only supports simple aggregation logic. Eg collect a counter for 1 minute and send it to the metrics collector.
+ * Ingestion pipeline - To aggregate data before writing to the DB, we need a stream processing engine like Flink. This reduces write volume significantly since only the calculated result is writting to the DB, but handling late arriving events could be a challenge. We also lose data precision and some flexibility as we don't store raw data.
+ * Query side - We can aggregate data when we run queries via our visualization system. There is no data loss, but queries can be slow due to a lot of data processing at query time and is run against the whole dataset.
 
 ## Query Service
 Having a separate query service from the time-series DB decouples the visualization and alerting system from the database, which enables us to decouple the DB from clients and change it at will.
 
-We can add a Cache layer here to reduce the load to the time-series database:
+We can add a Cache layer here to store query results and to reduce the load to the time-series database and to make query service more performant:
 ![cache-layer-query-service](images/cache-layer-query-service.png)
 
 We can also avoid adding a query service altogether as most visualization and alerting systems have powerful plugins to integrate with most time-series databases.
@@ -299,7 +299,7 @@ Finally, we can also use cold storage to use old data, which is no longer used. 
 ## Alerting system
 ![alerting-system](images/alerting-system.png)
 
-Configuration is loaded to cache servers. Rules are typically defined in YAML format. Here's an example:
+Configuration is loaded to cache servers. Rules are typically defined in YAML format as config files on the disk. Here's an example:
 ```
 - name: instance_down
   rules:
@@ -313,11 +313,11 @@ Configuration is loaded to cache servers. Rules are typically defined in YAML fo
 ```
 
 The alert manager fetches alert configurations from cache. Based on configuration rules, it also calls the query service at a predefined interval.
-If a rule is met, an alert event is created.
+If a rule is met (ie) if the value violates the threshold, an alert event is created.
 
 Other responsibilities of the alert manager are:
  * Filtering, merging and deduplicating alerts. Eg if an alert of a single instance is triggered multiple times, only one alert event is generated.
- * Access control - it is important to restrict alert-management operations to certain individuals only
+ * Access control - it is important to restrict alert-management operations to certain authorized individuals only
  * Retry - the manager ensures that the alert is propagated at least once.
 
 The alert store is a key-value database, like Cassandra, which keeps the state of all alerts. It ensures a notification is sent at least once.
