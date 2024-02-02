@@ -15,7 +15,7 @@ Before diving into designing the system, we should ask the interviewer questions
  * I: Yes
  * C: Other things to consider?
  * I: Yes, we allow overbooking by 10%. Hotel will sell more rooms than there actually are. Hotels do this in anticipation that clients will cancel bookings.
- * C: Since not much time, we'll focus on - show hotel-related page, hotel-room details page, reserve a room, admin panel, support overbooking.
+ * C: Since not much time, we'll focus on - show hotel-related page, hotel-room details page, reserve a room, admin panel, support overbooking. Hotel room search is out of scope due to complexity.
  * I: Sounds good.
  * I: One more thing - hotel prices change all the time. Assume a hotel room's price changes every day.
  * C: OK.
@@ -88,7 +88,7 @@ From our estimations, we know the scale of the system is not large, but we need 
 Given this knowledge, we'll choose a relational database because:
  * Relational DBs work well with read-heavy and less write-heavy systems.
  * NoSQL databases are normally optimized for writes, but we know we won't have many as only a fraction of users who visit the site make a reservation.
- * Relational DBs provide ACID guarantees. These are important for such a system as without them, we won't be able to prevent problems such as negative balance, double charge, etc.
+ * Relational DBs provide ACID (atomicity, consistency, isolation, durability) guarantees. These are important for such a system as without them, we won't be able to prevent problems such as negative balance, double charge, etc.
  * Relational DBs can easily model the data as the structure is very clear.
 
 Here is our schema design:
@@ -107,8 +107,8 @@ We've chosen a microservice architecture for this design. It has gained great po
 ![high-level-design](images/high-level-design.png)
  * Users book a hotel room on their phone or computer
  * Admin perform administrative functions such as refunding/cancelling a payment, etc
- * CDN caches static resources such as JS bundles, images, videos, etc
- * Public API Gateway - fully-managed service which supports rate limiting, authentication, etc.
+ * CDN (content delivery network) caches static resources such as JS bundles, images, videos, etc for better load time 
+ * Public API Gateway - fully-managed service which supports rate limiting, authentication, etc. API gateway is configured to direct requests to specific services based on the endpoints. 
  * Internal APIs - only visible to authorized personnel. Usually protected by a VPN.
  * Hotel service - provides detailed information about hotels and rooms. Hotel and room data is static, so it can be cached aggressively.
  * Rate service - provides room rates for different future dates. An interesting note about this domain is that prices depend on how full a hotel is at a given day.
@@ -152,13 +152,13 @@ Let's take a look at the `room_type_inventory` columns as that table is more int
  * hotel_id - id of hotel
  * room_type_id - id of a room type
  * date - a single date
- * total_inventory - total number of rooms minus those that are temporarily taken off the inventory.
+ * total_inventory - total number of rooms minus those that are temporarily taken off the inventory (eg for maintenance).
  * total_reserved - total number of rooms booked for given (hotel_id, room_type_id, date)
 
 There are alternative ways to design this table, but having one room per (hotel_id, room_type_id, date) enables easy 
-reservation management and easier queries.
+reservation management and easier queries. (hotel_id, room_type_id, date) is the composite primary key. 
 
-The rows in the table are pre-populated using a daily CRON job.
+The rows in the table are pre-populated using a daily CRON job as dates advance further by querying the inventory data across all future dates within 2 years.
 
 Sample data:
 | hotel_id | room_type_id | date       | total_inventory | total_reserved |
@@ -184,6 +184,7 @@ How to check availability for a specified number of rooms using that data (note 
 ```
 if (total_reserved + ${numberOfRoomsToReserve}) <= 110% * total_inventory
 ```
+If the condition returns True for all entires, it means there are enough rooms for each date within the date range. 
 
 Now let's do some estimation about the storage volume.
  * We have 5000 hotels.
@@ -211,6 +212,7 @@ There are two approaches to solving this problem:
  * Client-side handling - front-end can disable the book button once clicked. If a user disabled javascript, however, they won't see the button becoming grayed out.
  * Idemptent API - Add an idempotency key to the API, which enables a user to execute an action once, regardless of how many times the endpoint is invoked:
 ![idempotency](images/idempotency.png)
+An API call is idempotent if it produces the same result no matter how many times it is called. Here, reservation_id is idempotency key to avoid the double-reservation issue.
 
 Here's how this flow works:
  * A reservation order is generated once you're in the process of filling in your details and making a booking. The reservation order is generated using a globally unique identifier.
@@ -225,8 +227,8 @@ What if there are multiple users making the same reservation?
  * User 1 and 2 attempt to book the same room at the same time.
  * Transaction 1 checks if there are enough rooms - there are
  * Transaction 2 check if there are enough rooms - there are
- * Transaction 2 reserves the room and updates the inventory
- * Transaction 1 also reserves the room as it still sees there are 99 `total_reserved` rooms out of 100.
+ * Transaction 1 reserves the room and updates the inventory
+ * Transaction 2 also reserves the room as it still sees there are 99 `total_reserved` rooms out of 100. The isolation property in ACID means database transactions must complete their tasks independently from other transactions. So Transaction2 does not know about Transaction1.
  * Both transactions successfully commit the changes
 
 This problem can be solved using some form of locking mechanism:
@@ -269,7 +271,7 @@ Pros:
 Cons:
  * Deadlocks may occur when multiple resources are locked.
  * This approach is not scalable - if transaction is locked for too long, this has impact on all other transactions trying to access the resource.
- * The impact is severe when the query selects a lot of resources and the transaction is long-lived.
+ * The impact is severe when the query selects a lot of resources or involve multiple entities or the transaction is long-lived.
 
 The author doesn't recommend this approach due to its scalability issues.
 
@@ -281,10 +283,10 @@ There are two common ways to implement it - version numbers and timestamps. Vers
  * A new `version` column is added to the database table
  * Before a user modifies a database row, the version number is read
  * When the user updates the row, the version number is increased by 1 and written back to the database
- * Database validation prevents the insert if the new version number doesn't exceed the previous one
+ * Database validation prevents the insert if the new version number doesn't exceed the previous one by 1. In case of failure, the user tries again from step 2.
 
 Optimistic locking is usually faster than pessimistic locking as we're not locking the database. 
-Its performance tends to degrade when concurrency is high, however, as that leads to a lot of rollbacks.
+Its performance tends to degrade when concurrency is high, however, as that leads to a lot of rollbacks. In case of concurrency, users have to repeatedly retry till update succeeds per user. Although end result is correct, repeated retries cause a very unpleasant user experience.
 
 Pros:
  * It prevents applications from editing stale data
@@ -310,7 +312,7 @@ Pros:
 Cons:
  * Similar to optimistic locking, performs poorly when data contention is high
  * Database constraints cannot be easily version-controlled like application code
- * Not all databases support constraints
+ * Not all databases support constraints and can cause problems when we migrate from one database solution to another
 
 This is another good option for a hotel reservation system due to its ease of implementation.
 
@@ -330,7 +332,7 @@ We can shard based on `hotel_id` as all queries filter based on it.
 Assuming, QPS is 30,000, after sharding the database in 16 shards, each shard handles 1875 QPS, which is within a single MySQL cluster's load capacity.
 ![database-sharding](images/database-sharding.png)
 
-We can also utilize caching for room inventory and reservations via Redis. We can set TTL so that old data can expire for days which are past.
+We can also utilize caching for room inventory and reservations via Redis. We can set TTL so that old data can expire for days which are past. Redis is a good choice because TTL and Least Recently Used (LRU) cache eviction policy help us make optimal use of memory.
 ![inventory-cache](images/inventory-cache.png)
 
 The way we store an inventory is based on the `hotel_id`, `room_type_id` and `date`:
@@ -339,17 +341,16 @@ key: hotelID_roomTypeID_{date}
 value: the number of available rooms for the given hotel ID, room type ID and date.
 ```
 
-Data consistency happens async and is managed by using a CDC streaming mechanism - database changes are read and applied to a separate system.
+Data consistency happens async and is managed by using a CDC (change data capture - mechanism that reads the data changes in one database and applies the changes to another database system) streaming mechanism - database changes are read and applied to a separate system. 
 Debezium is a popular option for synchronizing database changes with Redis.
 
 Using such a mechanism, there is a possibility that the cache and database are inconsistent for some time.
-This is fine in our case because the database will prevent us from making an invalid reservation.
+This is fine in our case because the database will prevent us from making an invalid reservation. Database is the source of truth for inventory data.
 
-This will cause some issue on the UI as a user would have to refresh the page to see that "there are no more rooms left", 
-but that is something which can happen regardless of this issue if eg a person hesitates a lot before making a reservation.
+This will cause some issue on the UI as a user would have to refresh the page to see that "there are no more rooms left", but that is something which can happen regardless of this issue if eg a person hesitates a lot before making a reservation.
 
 Caching pros:
- * Reduced database load
+ * Reduced database load. Since read queries are handled by cache, database load is significantly reduced. 
  * High performance, as Redis manages data in-memory
 
 Caching cons:
@@ -373,7 +374,7 @@ It's more challenging, however, to guarantee this atomicity when the operation s
 ![microservice-non-atomic-operation](images/microservice-non-atomic-operation.png)
 
 There are some well-known techniques to handle these data inconsistencies:
- * Two-phase commit - a database protocol which guarantees atomic transaction commit across multiple nodes. 
+ * Two-phase commit - a database protocol which guarantees atomic transaction commit across multiple nodes (ie) either all nodes succeeded or all nodes failed.
    It's not performant, though, since a single node lag leads to all nodes blocking the operation.
  * Saga - a sequence of local transactions, where compensating transactions are triggered if any of the steps in a workflow fail. This is an eventually consistent approach.
 
