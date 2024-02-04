@@ -1,18 +1,19 @@
 # Real-time Gaming Leaderboard
-We are going to design a leaderboard for an online mobile game:
+We are going to design a leaderboard(users are assigned points for completing tasks and challenges and whoever has highest points is at top of leaderboard - leaderboard shows ranking of leading competitors and also displays the position of the user on it) for an online mobile game:
 ![leaderboard](images/leaderboard.png)
 
 # Step 1 - Understand the Problem and Establish Design Scope
  * C: How is the score calculated for the leaderboard?
- * I: User gets a point whenever they win a match.
+ * I: User gets a point whenever they win a match and it is added to their total score.
  * C: Are all players included in the leaderboard?
  * I: Yes
  * C: Is there a time segment, associated with the leaderboard?
  * I: Each month, a new tournament starts which starts a new leaderboard.
  * C: Can we assume we only care about top 10 users?
- * I: We want to display top 10 users, along with position of specific user. If time permits, we can discuss showing users around particular user in the leaderboard.
+ * I: We want to display top 10 users, along with position of specific user. If time permits, we can discuss showing 
+4 users above and below a particular user in the leaderboard.
  * C: How many users are in a tournament?
- * I: 5mil DAU and 25mil MAU
+ * I: 5mil DAU and 25mil MAU (monthly active users)
  * C: How many matches are played on average during a tournament?
  * I: Each player plays 10 matches per day on average
  * C: How do we determine the rank if two players have the same score?
@@ -31,8 +32,8 @@ We are going to design a leaderboard for an online mobile game:
  * General scalability, availability, reliability
 
 ## Back-of-the-envelope estimation
-With 50mil DAU, if the game has an even distribution of players during a 24h period, we'd have an average of 50 users per second.
-However, since distribution is typically uneven, we can estimate that the peak online users would be 250 users per second.
+With 5mil DAU, if the game has an even distribution of players during a 24h period, we'd have an average of 50 users per second (5000000 DAU/10^5 seconds = ~50 users per second).
+However, since distribution is typically uneven, we can estimate that the peak online users would be 250 users per second (5 x 50 users per second).
 
 QPS for users scoring a point - given 10 games per day on average, 50 users/s * 10 = 500 QPS. Peak QPS = 2500.
 
@@ -40,7 +41,7 @@ QPS for fetching the top 10 leaderboard - assuming users open that once a day on
 
 # Step 2 - Propose High-Level Design and Get Buy-In
 ## API Design
-The first API we need is one to update a user's score:
+The first API we need is one to update a user's score and position in leaderboard when user wins a game:
 ```
 POST /v1/scores
 ```
@@ -121,7 +122,7 @@ If the scale doesn't matter and we don't have that many users, a relational DB s
 We can start from a simple leaderboard table, one for each month (personal note - this doesn't make sense. You can just add a `month` column and avoid the headache of maintaining new tables each month): 
 ![leaderboard-table](images/leaderboard-table.png)
 
-There is additional data to include in there, but that is irrelevant to the queries we'd run, so it's omitted.
+There is additional data to include in there like game_id, timestamp, etc, but that is irrelevant to the queries we'd run, so it's omitted.
 
 What happens when a user wins a point?
 ![user-wins-point](images/user-wins-point.png)
@@ -157,14 +158,17 @@ LIMIT 10;
 ```
 
 This approach, however, doesn't scale well if the user is not at the top of the leaderboard and you'd want to locate their rank.
+SQL databases are not performant when we have to process large amounts of continuously changing information. Attempting to do a rank operation over millions of rows is going to take 10s of seconds, which is not acceptable for the desired real-time approach. Since the data is constantly changing, it is also not feasible to consider a cache. 
+
+A relational database is not designed to handle the high load of read queries this implementation would require. An RDS could be used successfully if done as a batch operation, but that would not align with the requirements to return a real-time poitions for the user on the leaderboard. Even with the LIMIT clause and adding an index, it essentially requires a table scan to determine rank and it does not provide a straightforward solution to find the rank of a user who is not at the top of the leaderboard.
 
 ### Redis solution
 We want to find a solution, which works well even for millions of players without having to fallback on complex database queries.
 
-Redis is an in-memory data store, which is fast as it works in-memory and has a suitable data structure to serve our needs - sorted set.
+Redis is an in-memory data store supporting key-value pairs, which does fast reads and writes as it works in-memory and has a suitable data structure to serve our needs - sorted set.
 
-A sorted set is a data structure similar to sets in programming languages, which allows you to keep a data structure sorted by a given criteria.
-Internally, it is implemented using a hash-map to maintain mapping between key (user_id) and value (score) and a skip list which maps scores to users in sorted order:
+A sorted set is a data structure similar to sets in programming languages, which allows you to keep a data structure sorted by a given criteria. Each member of a sorted set is associated with a score. The members of a set must be unique but scores may repeat. The score is used to rank the sorted set in ascending order.
+Internally, it is implemented using a hash-table (hash-map) to maintain mapping between key (user_id) and value (score) and a skip list which maps scores to users in sorted order:
 ![sorted-set](images/sorted-set.png)
 
 How does a skip list work?
@@ -173,7 +177,7 @@ How does a skip list work?
 ![skip-list](images/skip-list.png)
 
 This structure enables us to quickly search for specific values when the data set is large enough.
-In the example below (64 nodes), it requires traversing 62 nodes in a base linked list to find the given value and 11 nodes in the skip-list case:
+In the example below (64 nodes), it requires traversing 62 nodes in a base linked list (O(n)) to find the given value and 11 nodes in the skip-list (we add skipped levels till distance between nodes is n/2 -1 where n is the total number of nodes - makes searching faster - O(log n)) case:
 ![skip-list-performance](images/skip-list-performance.png)
 
 Sorted sets are more performant than relational databases as the data is kept sorted at all times at the price of O(logN) add and find operation.
@@ -213,11 +217,13 @@ What about user fetching their leaderboard position?
 ![leaderboard-position-of-user](images/leaderboard-position-of-user.png)
 
 This can be easily achieved by the following query, given that we know a user's leaderboard position:
+
+A user's position can be fetched using `ZREVRANK <table> <user-id>`.
+A user's relative position can be fetched using `ZREVRANGE <table> <user_rank - offset> <user_rank + offset>`
+Eg:
 ```
 ZREVRANGE leaderboard_feb_2021 357 365
 ```
-
-A user's position can be fetched using `ZREVRANK <user-id>`.
 
 Let's explore what our storage requirements are:
  * Assuming worst-case scenario of all 25mil MAU participating in the game for a given month
@@ -227,9 +233,9 @@ Let's explore what our storage requirements are:
 Another non-functional requirement to consider is supporting 2500 updates per second. This is well within a single Redis server's capabilities.
 
 Additional caveats:
- * We can spin up a Redis replica to avoid losing data when a redis server crashes
+ * We can spin up a Redis read replica to avoid losing data when a redis server crashes
  * We can still leverage Redis persistence to not lose data in the event of a crash
- * We'll need two supporting tables in MySQL to fetch user details such as username, display name, etc as well as store when eg a user won a game
+ * We'll need two supporting tables in MySQL to fetch user details such as username, display name, etc as well as store when eg a user won a game. This table can also be used for other queries like game history,etc.
  * The second table in MySQL can be used to reconstruct leaderboard when there is an infrastructure failure
  * As a small performance optimization, we could cache the user details of top 10 players as they'd be frequently accessed
 
@@ -240,10 +246,11 @@ We can either choose to deploy and manage our own services or use a cloud provid
 If we choose to manage the services our selves, we'll use redis for leaderboard data, mysql for user profile and potentially a cache for user profile if we want to scale the database:
 ![manage-services-ourselves](images/manage-services-ourselves.png)
 
-Alternatively, we could use cloud offerings to manage a lot of the services for us. For example, we can use AWS API Gateway to route API calls to AWS Lambda functions:
+Alternatively, we could use cloud offerings to manage a lot of the services for us. For example, we can use AWS API Gateway (provides a way to define HTTP endpoints of a RESTful API and connec to any backend services) to route API calls to AWS Lambda functions:
 ![api-gateway-mapping](images/api-gateway-mapping.png)
 
-AWS Lambda enables us to run code without managing or provisioning servers ourselves. It runs only when needed and scales automatically.
+AWS Lambda enables us to run code without managing or provisioning servers ourselves (serverless). It runs only when needed and scales automatically basedon traffic. At a high level, game calls API Gateway, which in turn invokes appropriate lambda functions which then invokes the appropriate commands on the storage layer (both Redis and MySQL), return the results back to API Gateway and then to the game application. 
+We can leverage Lambda functions to perform the queries we need without having to spin up a server instance. AWS provides support for Redis clients that can be called from the Lambda funcitons. This also allows for auto-scaling as needed with DAU growth. 
 
 Exmaple user scoring a point:
 ![user-scoring-point-lambda](images/user-scoring-point-lambda.png)
@@ -260,7 +267,7 @@ With 5mil DAU, we can get away with a single Redis instance from both a storage 
 
 However, if we imagine userbase grows 10x to 500mil DAU, then we'd need 65gb for storage and QPS goes to 250k.
 
-Such scale would require sharding.
+Such scale would require data sharding (fixed or hash partitions).
 
 One way to achieve it is by range-partitioning the data:
 ![range-partition](images/range-partition.png)
@@ -276,7 +283,7 @@ The latter is a O(1) operation as total records per shard can quickly be accesse
 Alternatively, we can use hash partitioning via Redis Cluster. It is a proxy which distributes data across redis nodes based on partitioning similar to consistent hashing, but not exactly the same:
 ![hash-partition](images/hash-partition.png)
 
-Calculating the top 10 players is challenging with this setup. We'll need to get the top 10 players of each shard and merge the results in the application:
+Calculating the top 10 players is challenging with this setup. We'll need to get the top 10 players of each shard and merge the results in the application (scatter-gather approach):
 ![top-10-players-calculation](images/top-10-players-calculation.png)
 
 There are some limitations with the hash partitioning:
@@ -295,10 +302,10 @@ An alternative solution to consider is using an appropriate NoSQL database optim
  * heavy writes
  * effectively sorting items within the same partition by score
 
-DynamoDB, Cassandra or MongoDB are all good fits.
+Amazon DynamoDB, Cassandra or MongoDB are all good fits.
 
 In this chapter, the author has decided to use DynamoDB. It is a fully-managed NoSQL database, which offers reliable performance and great scalability.
-It also enables usage of global secondary indexes when we need to query fields not part of the primary key.
+It also enables usage of global secondary indexes when we need to query fields not part of the primary key. A global secondary index contains a selection of attributes from the parent table, but they are organized using a different primary key.
 ![dynamo-db](images/dynamo-db.png)
 
 Let's start from a table for storing a leaderboard for a chess game:
@@ -336,5 +343,5 @@ A cron job can periodically run to analyze score distributions, based on which a
 # Step 4 - Wrap Up
 Other things to discuss if time permits:
  * Faster retrieval - We can cache the user object via a Redis hash with mapping `user_id -> user object`. This enables faster retrieval vs. querying the database.
- * Breaking ties - When two players have the same score, we can break the tie by sorting them based on last played game.
+ * Breaking ties - When two players have the same score, we can break the tie by sorting them based on last played game or timestamp with older timestamp ranking higher.
  * System failure recovery - In the event of a large-scale Redis outage, we can recreate the leaderboard by going through the MySQL WAL entries and recreate it via an ad-hoc script
