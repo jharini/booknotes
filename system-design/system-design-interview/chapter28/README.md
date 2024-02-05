@@ -8,7 +8,7 @@ You can also use it to pay for goods & services or transfer money to other users
  * C: Should we only focus on transfers between digital wallets? Should we support any other operations?
  * I: Let's focus on transfers between digital wallets for now.
  * C: How many transactions per second does the system need to support?
- * I: Let's assume 1mil TPS
+ * I: Let's assume 1 mil TPS
  * C: A digital wallet has strict correctness requirements. Can we assume transactional guarantees are sufficient?
  * I: Sounds good
  * C: Do we need to prove correctness?
@@ -20,7 +20,7 @@ You can also use it to pay for goods & services or transfer money to other users
 
 Here's what we have to support in summary:
  * Support balance transfers between two accounts
- * Support 1mil TPS
+ * Support 1 mil TPS
  * Reliability is 99.99%
  * Support transactions
  * Support reproducibility
@@ -28,7 +28,7 @@ Here's what we have to support in summary:
 ## Back-of-the-envelope estimation
 A traditional relational database, provisioned in the cloud can support ~1000 TPS.
 
-In order to reach 1mil TPS, we'd need 1000 database nodes. But if each transfer has two legs, then we actually need to support 2mil TPS.
+In order to reach 1mil TPS, we'd need 1000 database nodes. But if each transfer has two legs (-$x in one account, +$x in another account), then we actually need to support 2 mil TPS.
 
 One of our design goals would be to increase the TPS a single node can handle so that we can have less database nodes.
 | Per-node TPS | Node Number |
@@ -44,7 +44,7 @@ We only need to support one endpoint for this interview:
 POST /v1/wallet/balance_transfer - transfers balance from one wallet to another
 ```
 
-Request parameters - from_account, to_account, amount (string to not lose precision), currency, transaction_id (idempotency key).
+Request parameters - from_account (string), to_account(string), amount (string to not lose precision), currency(string), transaction_id (UUID - idempotency key).
 
 Sample response:
 ```
@@ -59,7 +59,7 @@ Our wallet application maintains account balances for every user account.
 
 One good data structure to represent this is a `map<user_id, balance>`, which can be implemented using an in-memory Redis store.
 
-Since one redis node cannot withstand 1mil TPS, we need to partition our redis cluster into multiple nodes.
+Since one redis node cannot withstand 1 mil TPS, we need to partition our redis cluster into multiple nodes.
 
 Example partitioning algorithm:
 ```
@@ -73,7 +73,7 @@ Zookeeper can be used to store the number of partitions and addresses of redis n
 Finally, a wallet service is a stateless service responsible for carrying out transfer operations. It can easily scale horizontally:
 ![wallet-service](images/wallet-service.png)
 
-Although this solution addresses scalability concerns, it doesn't allow us to execute balance transfers atomically.
+Although this solution addresses scalability concerns, it doesn't allow us to execute balance transfers atomically.It does not meet the correctness requirement. The wallet servcie updates two Redis nodes for each transfer but there is no guarantee both updates have happened successfully. The two updates need to be in a single atomic transaction.
 
 ## Distributed transactions
 One approach for handling transactions is to use the two-phase commit protocol on top of standard, sharded relational databases:
@@ -87,7 +87,7 @@ Here's how the two-phase commit (2PC) protocol works:
  * Otherwise, all databases are asked to abort the transaction
 
 Downsides to the 2PC approach:
- * Not performant due to lock contention
+ * Not performant due to lock contention (locks can be held for a very long time while waiting for a message from the other nodes)
  * The coordinator is a single point of failure
 
 ## Distributed transaction using Try-Confirm/Cancel (TC/C)
@@ -133,7 +133,7 @@ Other properties of TC/C:
 
 ## TC/C Failure modes
 If the coordinator dies mid-flight, it needs to recover its intermediary state. 
-That can be done by maintaining phase status tables, atomically updated within the database shards:
+That can be done by maintaining phase status tables, atomically updated within the database shards. The phase status tables are stored in the database that contains the wallet account from which money is deducted:
 ![phase-status-tables](images/phase-status-tables.png)
 
 What does that table contain:
@@ -168,17 +168,18 @@ Another popular approach is using Sagas - a standard for implementing distribute
 Here's how it works:
  * all operations are ordered in a sequence. All operations are independent in their own databases.
  * operations are executed from first to last
- * when an operation fails, the entire process starts to roll back until the beginning with compensating operations
+ * when an operation fails, the entire process starts to roll back until the beginning with compensating operations.
+ * If a distributed transaction has n operations, we need to prepare 2n operations: n operations for the normal case and another n for the compensating transaction during rollback.
 ![saga](images/saga.png)
 
 How do we coordinate the workflow? There are two approaches we can take:
- * Choreography - all services involved in a saga subscribe to the related events and do their part in the saga
+ * Choreography - all services involved in a saga subscribe to the related events and do their part in the saga. Fully decentralized coordination.
  * Orchestration - a single coordinator instructs all services to do their jobs in the correct order
 
-The challenge of using choreography is that business logic is split across multiple service, which communicate asynchronously.
+The challenge of using choreography is that business logic is split across multiple service, which communicate asynchronously. So each service has to maintain an internal state machine in order to understand what to do when other services emit an event. It can become hard to manage when there are many services.
 The orchestration approach handles complexity well, so it is typically the preferred approach in a digital wallet system.
 
-Here's a comparison between TC/C and Saga:
+Here's a comparison between TC/C and Saga (both application level distributed transactions):
 |                                           | TC/C            | Saga                     |
 |-------------------------------------------|-----------------|--------------------------|
 | Compensating action                       | In Cancel phase | In rollback phase        |
@@ -198,14 +199,14 @@ In real-life, a digital wallet application might be audited and we have to answe
  * How do we know the historical and current balances are correct?
  * How do we prove the system logic is correct after a code change?
 
-Event sourcing is a technique which helps us answer these questions.
+Event sourcing is a technique (developed in Domain Driven Design DDD) which helps us answer these questions.
 
 It consists of four concepts:
- * command - intended action from the real world, eg transfer 1$ from account A to B. Need to have a global order, due to which they're put into a FIFO queue.
+ * command - intended action from the real world, eg transfer 1$ from account A to B. Need to have a global order, due to which they're put into a FIFO queue. eg "transfer 1$ from A to B"
    * commands, unlike events, can fail and have some randomness due to eg IO or invalid state.
    * commands can produce zero or more events
    * event generation can contain randomness such as external IO. This will be revisited later
- * event - historical facts about events which occured in the system, eg "transferred 1$ from A to B".
+ * event - historical facts about events which occured in the system, eg "transfer**red** 1$ from A to B".
    * unlike commands, events are facts that have happened within our system
    * similar to commands, they need to be ordered, hence, they're enqueued in a FIFO queue
  * state - what has changed as a result of an event. Eg a key-value store between account and their balances.
@@ -226,7 +227,7 @@ Here's the full picture:
  * command is validated. If valid, two events for each of the accounts is generated
  * next event is read and applied by updating the balance (state) in the database
 
-The main advantage of using event sourcing is its reproducibility. In this design, all state update operations are saved as immutable history of all balance changes.
+The main advantage of using event sourcing is its reproducibility. In this design, all state update operations are saved as immutable history of all balance changes. The database is only used as an updated view of what balance looks like at any given point in time. In other designs, once the balance is updated, the historical balance information is lost. 
 
 Historical balances can always be reconstructed by replaying events from the beginning. 
 Because the event list is immutable and the state machine is deterministic, we are guaranteed to succeed in replaying any of the intermediary states.
@@ -237,13 +238,14 @@ All audit-related questions asked in the beginning of the section can be address
  * How do we know the historical and current balances are correct? - correctness can be verified by recalculating all events from the start
  * How do we prove the system logic is correct after a code change? - we can run different versions of the code against the events and verify their results are identical
 
-Answering client queries about their balance can be addressed using the CQRS architecture - there can be multiple read-only state machines which are responsible for querying the historical state, based on the immutable events list:
+Answering client queries about their balance can be addressed using the CQRS(command-query responsibility segregation) architecture - there can be multiple read-only state machines which are responsible for querying the historical state, based on the immutable events list. Rather than publishing the state (balance information), event sourcing publishes all the events. The external world can rebuild any customized state itself --> CQRS architecture - one write state machine and multiple read state machines for custom queries - these read state machines can derive different state representations from the event queue. The state information is an audit trail that could help to reconcile the financial records. The read-only state machines lag behind to some extent but will always catch up. The architecture design is eventually consistent.
 ![cqrs-architecture](images/cqrs-architecture.png)
 
 # Step 3 - Design Deep Dive
 In this section we'll explore some performance optimizations as we're still required to scale to 1mil TPS.
 
 ## High-performance event sourcing
+Till now, command and event store is in Kafka and state store is in relational database.
 The first optimization we'll explore is to save commands and events into local disk store instead of an external store such as Kafka.
 
 This avoids the network latency and also, since we're only doing appends, that operation is generally fast for HDDs.
@@ -255,15 +257,16 @@ At a low-level, we can achieve the aforementioned optimizations by leveraging a 
 
 The next optimization we can do is also store state in the local file system using SQLite - a file-based local relational database. RocksDB is also another good option.
 
-For our purposes, we'll choose RocksDB because it uses a log-structured merge-tree (LSM), which is optimized for write operations.
-Read performance is optimized via caching.
+For our purposes, we'll choose RocksDB because it uses a log-structured merge-tree (LSM - merging data from memory to disk level1 to disk level2 to all the way to disk level n), which is optimized for write operations.
+Read performance is optimized via caching the most recent data.
 ![rocks-db-approach](images/rocks-db-approach.png)
 
-To optimize the reproducibility, we can periodically save snapshots to disk so that we don't have to reproduce a given state from the very beginning every time. We could store snapshots as large binary files in distributed file storage, eg HDFS:
+To optimize the reproducibility, we can periodically save snapshots (periodically stop the state machine and save the current state in to a file - snapshot is an immutable view of a historical state) to disk so that we don't have to reproduce a given state from the very beginning every time. Once snapshot is saved, the state machine does not have to restat from teh very beginning anymore. It can read data from a snapshot, verify where it left off and resume processing from there. Daily snapshots are taken for the finance team at 00:00 for reconciliation and other purposes. Read only state machines can also load snapshots and go from there. We could store snapshots as large binary files in distributed file storage, eg HDFS:
 ![snapshot-approach](images/snapshot-approach.png)
+When everything is file based, the system can fully utilize the maximum I/O throughput of the computer hardware. 
 
 ## Reliable high-performance event sourcing
-All the optimizations done so far are great, but they make our service stateful. We need to introduce some form of replication for reliability purposes.
+All the optimizations done so far are great, but they make our service stateful. We need to introduce some form of replication for reliability purposes. We need to save data and computation but computation can be recovered by running same code on another node. So data needs be reliable. If it is lost, it is lost forever. We have four types of data: file based command, file based events, file based state and state snapshot.
 
 Before we do that, we should analyze what kind of data needs high reliability in our system:
  * state and snapshot can always be regenerated by reproducing them from the events list. Hence, we only need to guarantee the event list reliability.
@@ -274,21 +277,22 @@ In order to achieve high reliability for events, we need to replicate the list a
  * that there is no data loss
  * the relative order of data within a log file remains the same across replicas
 
-To achieve this, we can employ a consensus algorithm, such as Raft.
+To achieve this, we can employ a consensus algorithm (atleast half the nodes +1 should be active, up and updated), such as Raft.
 
 With Raft, there is a leader who is active and there are followers who are passive. If a leader dies, one of the followers picks up. 
 As long as more than half of the nodes are up, the system continues running.
 ![raft-replication](images/raft-replication.png)
 
-With this approach, all nodes update the state, based on the events list. Raft ensures leader and followers have the same events list.
+With this approach, all nodes update the state, based on the events list. Raft ensures leader and followers have the same events list. If learder crashes, the Raft algorithm selects a new leader which accepts the events from the state machine and replicates to followers. If a command is sent to leader and it then crashes before events are generated, client receives a timeout error and has to resend the command. If follower crashes, other followers continue till this one is fixed.
 
 ## Distributed event sourcing
-So far, we've managed to design a system which has high single-node performance and is reliable.
+So far, we've managed to design a system which has high single-node performance and is reliable. But we need 1 million TPS and one server is not enough for it. 
 
 Some limitations we have to tackle:
  * The capacity of a single raft group is limited. At some point, we need to shard the data and implement distributed transactions
  * In the CQRS architecture, the request/response flow is slow. A client would need to periodically poll the system to learn when their wallet has been updated
 
+Pull method:
 Polling is not real-time, hence, it can take a while for a user to learn about an update in their balance. Also, it can overload the query services if the polling frequency is too high:
 ![polling-approach](images/polling-approach.png)
 
@@ -305,7 +309,7 @@ Finally, to scale the system even further, we can shard the system into multiple
 
 Here's an example lifecycle of a balance transfer request in our final system:
  * User A sends a distributed transaction to the Saga coordinator with two operations - `A-1` and `C+1`.
- * Saga coordinator creates a record in the phase status table to trace the status of the transaction
+ * Saga coordinator creates a record in the phase status table (to keep track of what transaction is happening where) to trace the status of the transaction
  * Coordinator determines which partitions it needs to send commands to.
  * Partition 1's raft leader receives the `A-1` command, validates it, converts it to an event and replicates it across other nodes in the raft group
  * Event result is synchronized to the read state machine, which pushes a response back to the coordinator
