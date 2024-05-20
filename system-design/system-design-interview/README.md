@@ -33,3 +33,28 @@ Instead of getting the physical books, I've bought the online course, so there m
  * [Chapter 27 - Payment System](./chapter27)
  * [Chapter 28 - Digital Wallet](./chapter28)
  * [Chapter 29 - Stock Exchange](./chapter29)
+
+System Design LifeCycle(SDLC)
+
+1. Planning Stage
+2. Feasibility Study Stage
+3. System Design Stage
+4. Implementation Stage
+5. Testing Stage
+6. Deployment Stage
+7. Maintenance and Support
+
+Different types of Software Architecture Patterns include:
+
+Layered Pattern
+Client-Server Pattern
+Event-Driven Pattern
+Microkernel Pattern
+Microservices Pattern
+
+There are many different types of load balancers, and the specific type that is used in a given system will depend on the specific requirements of the system. Some common types of load balancers include:
+
+* Layer 4 load balancers operate at the network layer of the OSI model and distribute requests based on the source and destination IP addresses and port numbers of the requests.
+* Layer 7 load balancers operate at the application layer of the OSI model and distribute requests based on the content of the requests, such as the URL or the type of HTTP method used.
+* Global load balancers are used in distributed systems to distribute requests among multiple servers located in different geographic regions.
+* Application load balancers are specialized load balancers that are designed to work with specific types of applications or protocols, such as HTTP or HTTPS.
